@@ -1,0 +1,128 @@
+diff --git a/targets/f7/api_symbols.csv b/targets/f7/api_symbols.csv
+index 0179b6a..fa03c45 100644
+--- a/targets/f7/api_symbols.csv
++++ b/targets/f7/api_symbols.csv
+@@ -1,5 +1,5 @@
+ entry,status,name,type,params
+-Version,+,87.1,,
++Version,+,87.2,,
+ Header,+,applications/drivers/subghz/cc1101_ext/cc1101_ext_interconnect.h,,
+ Header,+,applications/main/archive/helpers/archive_helpers_ext.h,,
+ Header,+,applications/main/subghz/subghz_fap.h,,
+@@ -1395,6 +1395,7 @@ Function,+,furi_hal_bt_nvm_sram_sem_acquire,void,
+ Function,+,furi_hal_bt_nvm_sram_sem_release,void,
+ Function,+,furi_hal_bt_reinit,void,
+ Function,+,furi_hal_bt_set_key_storage_change_callback,void,"BleGlueKeyStorageChangedCallback, void*"
++Function,+,furi_hal_bt_set_device_name,_Bool,const char*
+ Function,+,furi_hal_bt_start_advertising,void,
+ Function,+,furi_hal_bt_start_app,FuriHalBleProfileBase*,"const FuriHalBleProfileTemplate*, FuriHalBleProfileParams, const GapRootSecurityKeys*, GapEventCallback, void*"
+ Function,+,furi_hal_bt_start_packet_rx,void,"uint8_t, uint8_t"
+@@ -2056,6 +2057,7 @@ Function,-,gap_extra_beacon_set_data,_Bool,"const uint8_t*, uint8_t"
+ Function,-,gap_extra_beacon_start,_Bool,
+ Function,-,gap_extra_beacon_stop,_Bool,
+ Function,-,gap_get_state,GapState,
++Function,-,gap_set_device_name,_Bool,const char*
+ Function,-,gap_init,_Bool,"GapConfig*, const GapRootSecurityKeys*, GapEventCallback, void*"
+ Function,-,gap_start_advertising,void,
+ Function,-,gap_stop_advertising,void,
+diff --git a/targets/f7/ble_glue/furi_ble/gatt.c b/targets/f7/ble_glue/furi_ble/gatt.c
+index b8ab094..31e1558 100644
+--- a/targets/f7/ble_glue/furi_ble/gatt.c
++++ b/targets/f7/ble_glue/furi_ble/gatt.c
+@@ -122,6 +122,21 @@ bool ble_gatt_characteristic_update(
+ 
+     tBleStatus result;
+     size_t retries_left = 1000;
++    // Patch: values longer than one ACI command (its length field is one byte) are written in
++    // pieces, so characteristics like long HID report maps keep all their bytes.
++    if(char_data_size > 240) {
++        uint16_t offset = 0;
++        do {
++            uint8_t chunk = (uint8_t)MIN(char_data_size - offset, 240);
++            result = aci_gatt_update_char_value_ext(
++                0, svc_handle, char_instance->handle, 0, char_data_size, offset, chunk, char_data + offset);
++            if(result == BLE_STATUS_INSUFFICIENT_RESOURCES && retries_left--) {
++                furi_delay_ms(1);
++                continue;
++            }
++            offset += chunk;
++        } while(result == BLE_STATUS_SUCCESS && offset < char_data_size);
++    } else
+     do {
+         retries_left--;
+         result = aci_gatt_update_char_value(
+diff --git a/targets/f7/ble_glue/gap.c b/targets/f7/ble_glue/gap.c
+index 38fc5e4..02b9178 100644
+--- a/targets/f7/ble_glue/gap.c
++++ b/targets/f7/ble_glue/gap.c
+@@ -359,7 +359,7 @@ static void gap_init_svc(Gap* gap, const GapRootSecurityKeys* root_keys) {
+     aci_gap_init(
+         GAP_PERIPHERAL_ROLE,
+         0,
+-        strlen(name),
++        GAP_DEVICE_NAME_MAX, // Patch: room for a name longer than the advertised one
+         &gap->service.gap_svc_handle,
+         &gap->service.dev_name_char_handle,
+         &gap->service.appearance_char_handle);
+@@ -660,3 +660,14 @@ void gap_emit_ble_beacon_status_event(bool active) {
+     gap->on_event_cb(event, gap->context);
+     FURI_LOG_I(TAG, "Beacon status event: %d", active);
+ }
++
++// Patch: sets the GAP Device Name characteristic (what hosts read after connecting), which can be
++// longer than the 20-character advertised name.
++bool gap_set_device_name(const char* name) {
++    if(!gap || !name) return false;
++    size_t len = strlen(name);
++    if(len > GAP_DEVICE_NAME_MAX) len = GAP_DEVICE_NAME_MAX;
++    return aci_gatt_update_char_value(
++               gap->service.gap_svc_handle, gap->service.dev_name_char_handle, 0, len, (const uint8_t*)name) ==
++           BLE_STATUS_SUCCESS;
++}
+diff --git a/targets/f7/ble_glue/gap.h b/targets/f7/ble_glue/gap.h
+index 2113a87..08de5cf 100644
+--- a/targets/f7/ble_glue/gap.h
++++ b/targets/f7/ble_glue/gap.h
+@@ -104,6 +104,12 @@ void gap_stop_advertising(void);
+ 
+ GapState gap_get_state(void);
+ 
++/** Patch: longest GAP Device Name characteristic value */
++#define GAP_DEVICE_NAME_MAX (32)
++
++/** Patch: set the GAP Device Name characteristic (may be longer than the advertised name) */
++bool gap_set_device_name(const char* name);
++
+ void gap_thread_stop(void);
+ 
+ void gap_emit_ble_beacon_status_event(bool active);
+diff --git a/targets/f7/furi_hal/furi_hal_bt.c b/targets/f7/furi_hal/furi_hal_bt.c
+index f1881f9..a48565f 100644
+--- a/targets/f7/furi_hal/furi_hal_bt.c
++++ b/targets/f7/furi_hal/furi_hal_bt.c
+@@ -252,6 +252,10 @@ bool furi_hal_bt_is_active(void) {
+     return gap_get_state() > GapStateIdle;
+ }
+ 
++bool furi_hal_bt_set_device_name(const char* name) {
++    return gap_set_device_name(name);
++}
++
+ void furi_hal_bt_start_advertising(void) {
+     if(gap_get_state() == GapStateIdle) {
+         gap_start_advertising();
+diff --git a/targets/furi_hal_include/furi_hal_bt.h b/targets/furi_hal_include/furi_hal_bt.h
+index 1711f70..b5d5fab 100644
+--- a/targets/furi_hal_include/furi_hal_bt.h
++++ b/targets/furi_hal_include/furi_hal_bt.h
+@@ -133,6 +133,10 @@ bool furi_hal_bt_is_active(void);
+  */
+ void furi_hal_bt_start_advertising(void);
+ 
++/** Patch: set the device name hosts read after connecting (up to 32 characters, longer than the
++ * advertised name). Call after the profile has started. */
++bool furi_hal_bt_set_device_name(const char* name);
++
+ /** Stop advertising
+  */
+ void furi_hal_bt_stop_advertising(void);

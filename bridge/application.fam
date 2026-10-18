@@ -1,0 +1,13 @@
+App(
+    appid="xbox_bridge",
+    name="Xbox Bridge",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="xbox_bridge_app",
+    requires=["gui", "bt"],
+    stack_size=8 * 1024,
+    fap_category="Bluetooth",
+    fap_icon="icon.png",
+    fap_libs=["ble_profile"],
+    fap_version="0.1",
+    fap_description="Presents the Flipper as an Xbox Wireless Controller, driven by a computer over USB",
+)

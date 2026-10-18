@@ -1,0 +1,4 @@
+.DS_Store
+*.fap
+build/
+.vscode/
